@@ -26,6 +26,7 @@ import subprocess
 import logging
 from time import time
 import binascii
+import shutil
 
 import sabnzbd
 from sabnzbd.encoding import TRANS, UNTRANS, unicode2local, name_fixer, \
@@ -233,7 +234,7 @@ def unpack_magic(nzo, workdir, workdir_complete, dele, one_folder, joinables, zi
             nzo.set_action_line()
 
 
-    if rerun:
+    if rerun and (cfg.enable_recursive() or new_ts or new_joins):
         z, y = unpack_magic(nzo, workdir, workdir_complete, dele, one_folder,
                             xjoinables, xzips, xrars, xts, depth)
         if z:
@@ -289,7 +290,6 @@ def get_seq_number(name):
         match, set, num = match_ts(name)
     else:
         num = tail[1:]
-    assert isinstance(num, str)
     if num.isdigit():
         return int(num)
     else:
@@ -300,6 +300,7 @@ def file_join(nzo, workdir, workdir_complete, delete, joinables):
         when succesful, delete originals
     """
     newfiles = []
+    bufsize = 24*1024*1024
 
     # Create matching sets from the list of files
     joinable_sets = {}
@@ -330,6 +331,11 @@ def file_join(nzo, workdir, workdir_complete, delete, joinables):
                 # done, go to next set
                 continue
 
+            # Only join when there is more than one file
+            size = len(current)
+            if size < 2:
+                continue
+
             # Prepare joined file
             filename = joinable_set
             if workdir_complete:
@@ -338,7 +344,6 @@ def file_join(nzo, workdir, workdir_complete, delete, joinables):
             joined_file = open(filename, 'ab')
 
             # Join the segments
-            size = len(current)
             n = get_seq_number(current[0])
             seq_error = n > 1
             for joinable in current:
@@ -347,8 +352,11 @@ def file_join(nzo, workdir, workdir_complete, delete, joinables):
                 perc = (100.0 / size) * n
                 logging.debug("Processing %s", joinable)
                 nzo.set_action_line(T('Joining'), '%.0f%%' % perc)
+                if joinable.count(".000") == 1 and os.path.getsize(joinable)<1000 :
+                    logging.debug('Skipping: %s', joinable)
+                    continue
                 f = open(joinable, 'rb')
-                joined_file.write(f.read())
+                shutil.copyfileobj(f, joined_file, bufsize)
                 f.close()
                 if delete:
                     logging.debug("Deleting %s", joinable)
@@ -649,6 +657,18 @@ def rar_extract_core(rarfile, numrars, one_folder, nzo, setname, extraction_path
             nzo.set_unpack_info('Unpack', unicoder(msg), set=setname)
             fail = 2
 
+        elif 'is not RAR archive' in line:
+            # Unrecognizable RAR file
+            m = re.search('(.+) is not RAR archive', line)
+            if m:
+                filename = TRANS(m.group(1)).strip()
+            else:
+                filename = '???'
+            nzo.fail_msg = T('Unusable RAR file')
+            msg = ('[%s][%s] '+ Ta('Unusable RAR file')) % (setname, latin1(filename))
+            nzo.set_unpack_info('Unpack', unicoder(msg), set=setname)
+            fail = 1
+
         else:
             m = re.search(r'^(Extracting|Creating|...)\s+(.*?)\s+OK\s*$', line)
             if m:
@@ -789,7 +809,7 @@ def ZIP_Extract(zipfile, extraction_path, one_folder):
 # PAR2 Functions
 #------------------------------------------------------------------------------
 
-def par2_repair(parfile_nzf, nzo, workdir, setname):
+def par2_repair(parfile_nzf, nzo, workdir, setname, single):
     """ Try to repair a set, return readd or correctness """
     #set the current nzo status to "Repairing". Used in History
 
@@ -823,7 +843,7 @@ def par2_repair(parfile_nzf, nzo, workdir, setname):
             joinables, zips, rars, ts = build_filelists(workdir, None, check_rar=False)
 
             finished, readd, pars, datafiles, used_joinables, used_par2 = PAR_Verify(parfile, parfile_nzf, nzo,
-                                                                                     setname, joinables)
+                                                                                     setname, joinables, single=single)
 
             if finished:
                 result = True
@@ -915,7 +935,7 @@ _RE_IS_MATCH_FOR = re.compile('File: "([^"]+)" - is a match for "([^"]+)"')
 _RE_LOADING_PAR2 = re.compile('Loading "([^"]+)"\.')
 _RE_LOADED_PAR2 = re.compile('Loaded (\d+) new packets')
 
-def PAR_Verify(parfile, parfile_nzf, nzo, setname, joinables, classic=False):
+def PAR_Verify(parfile, parfile_nzf, nzo, setname, joinables, classic=False, single=False):
     """ Run par2 on par-set """
     if cfg.never_repair():
         cmd = 'v'
@@ -949,10 +969,14 @@ def PAR_Verify(parfile, parfile_nzf, nzo, setname, joinables, classic=False):
 
     # Append the wildcard for this set
     wildcard = '%s*' % os.path.join(os.path.split(parfile)[0], setname)
-    if len(globber(wildcard, None)) < 2:
+    if single or len(globber(wildcard, None)) < 2:
         # Support bizarre naming conventions
         wildcard = os.path.join(os.path.split(parfile)[0], '*')
-    command.append(wildcard)
+    if sabnzbd.WIN32 or sabnzbd.DARWIN:
+        command.append(wildcard)
+    else:
+        flist = [item for item in globber(wildcard, None) if os.path.isfile(item)]
+        command.extend(flist)
 
     stup, need_shell, command, creationflags = build_command(command)
     logging.debug('Starting par2: %s', command)
@@ -1258,7 +1282,7 @@ def PAR_Verify(parfile, parfile_nzf, nzo, setname, joinables, classic=False):
 
     if retry_classic:
         logging.debug('Retry PAR2-joining with par2-classic')
-        return PAR_Verify(parfile, parfile_nzf, nzo, setname, joinables, classic=True)
+        return PAR_Verify(parfile, parfile_nzf, nzo, setname, joinables, classic=True, single=single)
     else:
         return finished, readd, pars, datafiles, used_joinables, used_par2
 
@@ -1353,12 +1377,14 @@ def build_filelists(workdir, workdir_complete, check_rar=True):
     if workdir_complete:
         for root, dirs, files in os.walk(workdir_complete):
             for _file in files:
-                filelist.append(os.path.join(root, _file))
+                if '.AppleDouble' not in root and '.DS_Store' not in root:
+                    filelist.append(os.path.join(root, _file))
 
     if workdir and not filelist:
         for root, dirs, files in os.walk(workdir):
             for _file in files:
-                filelist.append(os.path.join(root, _file))
+                if '.AppleDouble' not in root and '.DS_Store' not in root:
+                    filelist.append(os.path.join(root, _file))
 
     if check_rar:
         joinables = [f for f in filelist if SPLITFILE_RE.search(f) and not is_rarfile(f)]
@@ -1367,10 +1393,7 @@ def build_filelists(workdir, workdir_complete, check_rar=True):
 
     zips = [f for f in filelist if ZIP_RE.search(f)]
 
-    if check_rar:
-        rars = [f for f in filelist if RAR_RE.search(f) and is_rarfile(f)]
-    else:
-        rars = [f for f in filelist if RAR_RE.search(f)]
+    rars = [f for f in filelist if RAR_RE.search(f)]
 
     ts = [f for f in filelist if TS_RE.search(f) and f not in joinables]
 
